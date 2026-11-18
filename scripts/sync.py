@@ -46,7 +46,7 @@ DEFAULTS: dict = {
     "notebook": "20260804153230-7rdiobh",  # 00-Inspires
     "paths": {"wechat": "/wechat", "x": "/x"},
     "ledger_projects": {"wechat": "siyuan-wechat", "x": "siyuan-x-article"},
-    "ima": {"knowledge_base": "ima_kb_lBjZm8kf", "scan_limit": 50, "fetch_delay": 12},
+    "ima": {"knowledge_base": "ima_kb_lBjZm8kf", "scan_limit": 50, "fetch_delay": 12, "stub_on_share": False},
     "x": {"count": 100},
     "data_dir": "~/.cache/sync-to-siyuan",
 }
@@ -60,11 +60,30 @@ WECHAT_UA = (
     "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 )
 
+# 公众号「分享页」模板：微信只对微信内返回正文，HTTP 抓到的页面没有 #js_content，
+# 只有一坨 window.cgiDataNew 之类的内联 JS。整页丢给 wechat2md 会转出 2MB 的 JS 垃圾，
+# 进 SiYuan 后页面直接卡死 —— 所以在转换前后各设一道闸，宁可失败也不写垃圾。
+WECHAT_CONTENT_MARKER = 'id="js_content"'
+# 贴图文章（item_show_type=8）没有 #js_content，正文/图片全在 window.cgiDataNew 里，
+# wechat2md 现在能直接解这个 JS 字面量 —— 所以这类页面照常转，不算「抓不到」。
+WECHAT_PICDATA_MARKERS = ("cgiDataNew", "content_noencode", "picture_page_info_list")
+MAX_DOC_BYTES = 400_000
+GARBAGE_MARKERS = ("__canAsyncImport", "cgiDataNew", "window.page_begintime", "使用完整服务")
+
 LEDGER_UA = "sync-to-siyuan/1.0"  # Cloudflare answers 1010 to urllib's default UA
 
 
 class SyncError(Exception):
     pass
+
+
+class SharePageError(SyncError):
+    """公众号只给了分享页模板（微信内才有正文）：拿不到正文，但能拿到标题与摘要。"""
+
+    def __init__(self, message: str, title: str = "", desc: str = ""):
+        super().__init__(message)
+        self.title = title
+        self.desc = desc
 
 
 # ------------------------------------------------------------------ 基础工具
@@ -641,6 +660,43 @@ def fetch_wechat_html(url: str, timeout: int = 60) -> str:
     return re.sub(r"<img\b[^>]*>", fix, html)
 
 
+def has_pictext_data(html: str) -> bool:
+    return all(marker in html for marker in WECHAT_PICDATA_MARKERS)
+
+
+def share_page_meta(html: str) -> tuple[str, str]:
+    """分享页上唯一能拿到的信息：标题 + 摘要（meta description / content_noencode）。"""
+    title = ""
+    match = re.search(r'<meta property="og:title" content="([^"]*)"', html)
+    if match:
+        title = match.group(1)
+    if not title:
+        match = re.search(r"msg_title\s*=\s*window\.title\s*=\s*'([^']*)'", html)
+        if match:
+            title = match.group(1)
+    desc = ""
+    match = re.search(r'<meta name="description" content="([^"]*)"', html)
+    if match:
+        desc = match.group(1)
+    if not desc:
+        match = re.search(r"content_noencode:\s*'([^']*)'", html)
+        if match:
+            desc = match.group(1)
+    # 微信只对 ASCII 做了 \xNN 转义（\x26quot; 等），整串 unicode_escape 会把 UTF-8 中文弄坏
+    for escaped, plain in (
+        ("\\x26quot;", '"'),
+        ("\\x26amp;", "&"),
+        ("\\x26", "&"),
+        ("\\x0a", " "),
+        ("\\x3d", "="),
+        ("\\x27", "'"),
+        ("\\x22", '"'),
+    ):
+        desc = desc.replace(escaped, plain)
+    desc = re.sub(r"\s+", " ", desc).strip()
+    return title.strip(), desc.strip()
+
+
 def parse_frontmatter(text: str) -> tuple[dict, str]:
     if not text.startswith("---"):
         return {}, text
@@ -677,6 +733,34 @@ def source_block(item: dict, author: str, published: str) -> str:
     return f"> {meta}\n> sync-id: {item['id']}\n"
 
 
+def share_stub_markdown(item: dict, error: "SharePageError") -> tuple[str, dict]:
+    """分享页只能拿到标题+摘要时，发一张「链接卡片」而不是一篇假文章。"""
+    title = error.title or item.get("title") or "未命名文章"
+    parts = [
+        "> [!TIP] 正文需在微信里打开",
+        "> 这篇文章微信只对「微信内打开」返回正文；HTTP 拿到的是分享页（无 `#js_content`），"
+        "所以这里只有标题、摘要和原链接。",
+        "",
+    ]
+    if error.desc:
+        parts += ["**摘要（微信给的分享描述）**", "", error.desc, ""]
+    markdown = f"{source_block(item, '', '')}\n" + "\n".join(parts)
+    guard_markdown(markdown, item)
+    return markdown, {"title": title, "author": "", "published": "", "bytes": len(markdown.encode())}
+
+
+def guard_markdown(markdown: str, item: dict) -> None:
+    """转换结果的安检：整页 JS 混入、体积离谱，都不许进库（会卡死 SiYuan 页面）。"""
+    size = len(markdown.encode())
+    if size > MAX_DOC_BYTES:
+        raise SyncError(
+            f"转换结果 {size} 字节，超过 {MAX_DOC_BYTES} 上限（公众号正文不会这么大，疑似整页 JS 混入），丢弃"
+        )
+    hit = next((marker for marker in GARBAGE_MARKERS if marker in markdown), None)
+    if hit:
+        raise SyncError(f"转换结果里混进了页面 JS（命中 {hit!r}），丢弃")
+
+
 def article_markdown(item: dict, config: dict) -> tuple[str, dict]:
     """把来源正文抓成 markdown，并拼上 SiYuan 侧的来源/同步标记。"""
     tmp = data_dir(config) / "tmp"
@@ -693,6 +777,13 @@ def article_markdown(item: dict, config: dict) -> tuple[str, dict]:
             raise SyncError(f"抓取文章 HTML 失败: {getattr(exc, 'reason', exc)}")
         html_path = tmp / (item["id"].replace(":", "-") + ".html")
         html_path.write_text(html, encoding="utf-8")
+        if WECHAT_CONTENT_MARKER not in html and not has_pictext_data(html):
+            title, desc = share_page_meta(html)
+            raise SharePageError(
+                "公众号只返回了分享页模板，页面上既没有 #js_content 也没有 cgiDataNew 数据（正文仅微信内可见）",
+                title=title,
+                desc=desc,
+            )
         stdout = run(
             ["node", str(script), str(html_path), "-o", str(out_path)],
             cwd=deps,
@@ -741,6 +832,7 @@ def article_markdown(item: dict, config: dict) -> tuple[str, dict]:
     title = (title or item.get("title") or "未命名文章").strip()
     # SiYuan 的文档名就是标题，正文里再来一个同名 H1 就是重复标题
     markdown = f"{source_block(item, author, published)}\n{strip_leading_noise(body)}\n"
+    guard_markdown(markdown, item)
     return markdown, {"title": title, "author": author, "published": published, "bytes": len(markdown.encode())}
 
 
@@ -904,10 +996,22 @@ def cmd_publish(args) -> int:
             # 批量抓公众号的礼貌间隔（skill 建议 10~20s，随机抖动）
             time.sleep(random.uniform(delay * 0.6, delay * 1.4))
         fetched += 1
+        stub = False
         try:
             markdown, meta = article_markdown(item, config)
+        except SharePageError as exc:
+            if not args.stub_on_share:
+                report["failed"].append(
+                    {"id": item_id, "stage": "share_page", "error": str(exc)[:400], "title": exc.title or item.get("title")}
+                )
+                log(f"⛔ {item_id} 分享页（微信内才有正文），跳过：{exc.title or item.get('title')}")
+                continue
+            markdown, meta = share_stub_markdown(item, exc)
+            stub = True
         except (SyncError, OSError) as exc:
-            report["failed"].append({"id": item_id, "stage": "convert", "error": str(exc)[:400]})
+            message = str(exc)
+            stage = "guard" if ("丢弃" in message or "上限" in message) else "convert"
+            report["failed"].append({"id": item_id, "stage": stage, "error": message[:400]})
             continue
         hpath = unique_hpath(base, item.get("title") or meta["title"], item_id, existing_paths)
         payload = {**item, "title": meta["title"] or item.get("title")}
@@ -923,7 +1027,15 @@ def cmd_publish(args) -> int:
         ledger.add([item_id])
         already.add(item_id)
         report["published"].append(
-            {"id": item_id, "doc": doc_id, "path": hpath, "title": payload["title"], "bytes": meta["bytes"], "url": item.get("url")}
+            {
+                "id": item_id,
+                "doc": doc_id,
+                "path": hpath,
+                "title": payload["title"],
+                "bytes": meta["bytes"],
+                "url": item.get("url"),
+                **({"stub": True} if stub else {}),
+            }
         )
         log(f"✅ {item_id} -> {hpath}")
 
@@ -943,6 +1055,10 @@ def cmd_publish(args) -> int:
 
 
 # ---------------------------------------------------------------------- CLI
+
+
+def config_default_stub() -> bool:
+    return bool(load_config()["ima"].get("stub_on_share"))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -973,6 +1089,12 @@ def main(argv: list[str] | None = None) -> int:
     p_pub.add_argument("--report", help="报告输出路径")
     p_pub.add_argument("--ignore-siyuan", action="store_true", help="只信台账，不扫 SiYuan 文档")
     p_pub.add_argument("--strict-ledger", action="store_true", help="台账不可用就直接失败")
+    p_pub.add_argument(
+        "--stub-on-share",
+        action="store_true",
+        default=bool(config_default_stub()),
+        help="分享页（微信内才有正文）也发一张链接卡片；默认跳过记 failed",
+    )
     p_pub.set_defaults(func=cmd_publish)
 
     args = parser.parse_args(argv)

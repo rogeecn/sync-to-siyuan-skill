@@ -88,6 +88,7 @@ python3 scripts/sync.py status                     # 台账 + SiYuan 各自多�
 3. 对每个候选调 `get_media_info` 换出真实 `mp.weixin.qq.com` URL —— **链接不落库，只在内存/缓存里**（`~/.cache/sync-to-siyuan/ima-media-cache.json`，按 media_id 缓存，第二轮不用再调）；
 4. **自己把 HTML 拿回来**（iPhone UA）→ 把 `<img data-src>` 补成 `<img src>` → 交给 `wechat2md` 转 Markdown。
    微信正文图片是懒加载，只有 `data-src`、没有 `src`，turndown 会整张丢掉（实测一篇 28 图的文章转出来 0 张图）。补 src 是唯一由本 skill 亲自做的一步，表格/代码块等转换规则全部仍由 wechat2md 负责。
+   **贴图文章**（微信只给分享页、没有 `#js_content`）由 wechat2md 解 `window.cgiDataNew` 处理（`content_noencode` + `picture_page_info_list[].cdn_url`），本 skill 只负责放行。
 5. 剥掉 wechat2md 写的 YAML frontmatter，标题/作者/发布时间转成文档顶部的一行来源块。
 6. 批量抓取之间默认等 12s（`ima.fetch_delay`，±40% 抖动）——公众号抓取的礼貌间隔。
 
@@ -132,6 +133,8 @@ SiYuan 的**文档名就是标题**，正文里不再重复一个 H1：
 | `权限拒绝：… 需要 W` | 目标笔记本权限不是 `RW`。`python3 <siyuan-skill>/scripts/siyuan.py perms set <nb> R,W && perms confirm`（**先问用户**） |
 | 微信抓回空正文 / 极短 | 风控或已删除。等 60s 再试，或跳过这一条（别把空文档发进去） |
 | `get_media_info` 没有 `url_info` | IMA 侧媒体不可访问（附件/文件类）。跳过即可 |
+| `转换结果 … 超过 400000 上限（疑似整页 JS 混入）` | 第二道闸。说明 wechat2md 又把整页 JS 当正文了 —— 先升级 wechat2md（贴图文章支持），再重跑；**绝不要调高 `MAX_DOC_BYTES` 放行** |
+| `stage: share_page` | 页面既没有 `#js_content` 也没有 `cgiDataNew` 数据（真·只在微信里能看）。默认记 failed 不建文档；要留链接就 `--stub-on-share` 发一张卡片 |
 | ledger 返回 `{"error":"since is required"}` | 手写 curl 时漏了 `since`；`sync.py` 已自带 `since=1970` |
 | `台账 read 失败…改用 SiYuan 扫描兜底` | Cloudflare 偶发掐连接，已重试 4 次；读到 SiYuan 就够，事后 `seed` 补齐台账 |
 | `status` 里 `synced: null` | 同上，台账读不到时报 null，**不会把「没读到」显示成 0** |
@@ -149,4 +152,6 @@ scripts/sync.py        # doctor / seed / plan / publish / status
 
 ## 一次完整跑的实测口径（2026-11-18）
 
-`plan --source all` → `publish`：微信窗口 50 条 → 50 篇全部入库（261 张图保留），X 书签 100 条里 3 条长文入库；重跑 plan 两条来源 `new: 0`；台账与 SiYuan 扫描 53 = 53。单篇微信约 25–45s（抓 HTML 3MB + 转换 + 建文档 + 礼貌间隔），50 篇要 20 分钟上下 —— 命令跑长任务时记得给自己留足够的 timeout。
+`plan --source all` → `publish`：微信窗口 50 条 → 50 篇全部入库，X 书签 100 条里 3 条长文入库；重跑 plan 两条来源 `new: 0`；台账与 SiYuan 扫描 53 = 53。单篇微信约 25–45s（抓 HTML 3MB + 转换 + 建文档 + 礼貌间隔），50 篇要 20 分钟上下 —— 命令跑长任务时记得给自己留足够的 timeout。
+
+50 篇正文合计 227KB（最大一篇 11.7KB），其中 9 篇是贴图文章（1–6KB + 1–8 张图）。**历史教训**：贴图文章曾因为整页转出 2MB 内联 JS，把 SiYuan 页面卡死 —— 现在体积闸 + JS 特征闸 + wechat2md 的 `cgiDataNew` 解析三重兜底。

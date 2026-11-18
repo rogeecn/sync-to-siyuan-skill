@@ -91,9 +91,10 @@ python3 scripts/sync.py status                    # 台账 & SiYuan 各多少条
 
 id 规则：微信 `wx:<slug>`（`mp.weixin.qq.com/s/<slug>`），X 长文 `x:<tweet_id>`（发长文的推文 id）。
 
-## 两个已知的实现细节
+## 三个已知的实现细节
 
 - **图片**：微信正文图片是懒加载，只有 `data-src` 没有 `src`，turndown 会整张丢掉（实测 28 图 → 0 图）。本 skill 自己抓 HTML 把 `data-src` 补成 `src`，再喂给 wechat2md —— 表格/代码块等转换规则仍全部由 wechat2md 负责。
+- **贴图文章**：有一类文章微信只返回分享页模板，页面里没有 `#js_content`，正文和图片全在 `window.cgiDataNew` 里。整页转会把 2MB 内联 JS 当正文写进思源（页面直接卡死）。wechat2md 现在会解这个字面量（`content_noencode` + `picture_page_info_list[].cdn_url`），本 skill 在转换前后另加两道闸：体积 >400KB、或命中 `cgiDataNew`/`__canAsyncImport`/`使用完整服务` 一律丢弃。真拿不到正文的页面记 `failed`，不会写入空文档。
 - **索引异步**：文档刚 `create` 出来时 SiYuan 的 blocks 索引还没落库，`attr set` 会反查失败，`publish` 会退避重试 6 次；仍失败的那条正文里还有 `sync-id:` 行，去重不会漏。
 
 更多细节（X 长文识别、排错表、实测口径）见 [SKILL.md](SKILL.md)。
