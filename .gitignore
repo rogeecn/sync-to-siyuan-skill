@@ -1,0 +1,14 @@
+# Runtime artifacts（plan/报告是每次运行的快照，不入库）
+plan*.json
+report*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Tooling caches
+.codegraph/
+.unipi/
+.DS_Store
