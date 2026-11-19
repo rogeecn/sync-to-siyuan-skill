@@ -7,13 +7,15 @@
   * 知识库里的文章链接  ima skill           (node ima_api.cjs <endpoint> <json>)
   * X 书签 / X 长文     twitter-cli         (twitter bookmarks --json / twitter article -m)
   * 写进思源           siyuan skill         (python3 siyuan.py create/attr/sql)
+  * 网络图片转本地      siyuan skill         (python3 siyuan.py asset netimg)
   * 已同步 id 台账      id-ledger-query     (POST/GET /v1/projects/<key>/ids)
 
 子命令
   doctor   依赖与凭据体检（不写任何东西）
   seed     从已有 SiYuan 文档回填台账（跑一次；台账丢了重跑即可恢复）
   plan     拉取来源 -> 去掉已同步 -> 写 plan-<source>.json
-  publish  按 plan 转换 + 发布到 SiYuan，并逐条写台账
+  publish  按 plan 转换 + 发布到 SiYuan，并逐条写台账，随后把正文里的网络图片刷成本地资源
+  localize 给已入库的文档补做图片本地化（历史批次还是远程图片时用）
   status   台账里两个 project 各有多少 id
 
 常规增量：plan ->（可选：agent 改标题）-> publish
@@ -48,10 +50,15 @@ DEFAULTS: dict = {
     "ledger_projects": {"wechat": "siyuan-wechat", "x": "siyuan-x-article"},
     "ima": {"knowledge_base": "ima_kb_lBjZm8kf", "scan_limit": 50, "fetch_delay": 12, "stub_on_share": False},
     "x": {"count": 100},
+    # 发布后把正文里的网络图片下载成本地资源：微信/知乎有防盗链，远程图会 403 或空白
+    "images": {"localize": True, "timeout": 900},
     "data_dir": "~/.cache/sync-to-siyuan",
 }
 
 ARTICLE_URL_RE = re.compile(r"https?://(?:www\.)?(?:x|twitter)\.com/i/article/(\d+)")
+# 正文里还剩多少远程图片（netimg 的期望值；内核失败是静默的，只能靠数量对账）
+MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(\s*(https?://[^)\s\"']+)")
+HTML_IMAGE_RE = re.compile(r"<img\b[^>]*\bsrc=[\"'](https?://[^\"']+)", re.IGNORECASE)
 SYNC_ID_RE = re.compile(r"sync-id[:：]\s*([A-Za-z0-9:._-]{4,})")
 WECHAT_SLUG_RE = re.compile(r"mp\.weixin\.qq\.com/s/([A-Za-z0-9_-]+)")
 
@@ -232,11 +239,12 @@ def siyuan_env() -> dict:
     return env
 
 
-def sy(args: list[str], *, input_text: str | None = None, json_out: bool = False) -> str:
+def sy(args: list[str], *, input_text: str | None = None, json_out: bool = False,
+       timeout: int = 180) -> str:
     cmd = [sys.executable, str(siyuan_script()), *args]
     if json_out and "--json" not in cmd:
         cmd.append("--json")
-    return run(cmd, input_text=input_text, env=siyuan_env(), timeout=180)
+    return run(cmd, input_text=input_text, env=siyuan_env(), timeout=timeout)
 
 
 def sy_sql(query: str) -> list[dict]:
@@ -607,6 +615,49 @@ def unique_hpath(base: str, title: str, item_id: str, existing: set[str]) -> str
     return candidate
 
 
+def count_remote_images(markdown: str) -> int:
+    """正文里还有多少个不同的远程图片（= netimg 应该转换的数量，用来发现静默失败）。"""
+    return len(set(MD_IMAGE_RE.findall(markdown)) | set(HTML_IMAGE_RE.findall(markdown)))
+
+
+def localize_assets(doc_id: str, referer: str = "", config: dict | None = None) -> dict:
+    """把文档里的网络图片下载成 assets/network-asset-*（内核 netImg2LocalAssets）。
+
+    微信/知乎图片有防盗链，直接引用远程链接会 403 或空白，所以发布后必须本地化。
+    内核下载失败是**静默**的（403/404/超时/返回 text/html 照样 code=0，只写服务端日志），
+    所以只认 `converted`（`network-asset-*` 数量差）；调用方拿它和正文对账。
+    """
+    config = config or load_config()
+    timeout = int((config.get("images") or {}).get("timeout") or 900)
+    args = ["asset", "netimg", doc_id]
+    if referer:
+        # 这个 Referer 只影响内核发出去的请求头，能显著提高防盗链站点的成功率
+        args += ["--referer", referer]
+    out = sy(args, timeout=timeout)
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        raise SyncError(f"asset netimg 输出不是 JSON: {out[:200]}")
+    return {"converted": int(data.get("converted") or 0), "mode": data.get("mode") or "image"}
+
+
+def localize_after_publish(doc_id: str, item_id: str, referer: str, markdown: str,
+                           config: dict) -> dict:
+    """发布后的图片本地化：只记结果，不让它把一条已入库的文档判成失败。"""
+    expected = count_remote_images(markdown)
+    try:
+        result = {**localize_assets(doc_id, referer, config=config), "expected": expected}
+    except Exception as exc:  # noqa: BLE001 - 文档已建、台账已写，图片是锦上添花
+        log(f"⚠ {item_id} 图片本地化调用失败（文档已建）：{str(exc)[:200]}")
+        return {"error": str(exc)[:300], "expected": expected}
+    if result["converted"] < expected:
+        log(
+            f"⚠ {item_id} 图片本地化 {result['converted']}/{expected}，"
+            "其余可能被防盗链/超大/非图片响应拦下，重跑 localize 或手工 upload"
+        )
+    return result
+
+
 def publish_doc(notebook: str, hpath: str, markdown: str, item: dict) -> str:
     out = sy(["create", notebook, hpath, "-f", "-", "--json"], input_text=markdown, json_out=True)
     try:
@@ -870,6 +921,7 @@ def cmd_doctor(args) -> int:
     check("twitter 登录", twitter_auth)
     check("siyuan skill", lambda: str(siyuan_script()))
     check("siyuan 连通", lambda: sy(["ping"]).strip().splitlines()[-1][:120])
+    check("siyuan 图片本地化", lambda: "netimg" in sy(["asset", "--help"], timeout=60))
 
     def notebook_perm():
         out = sy(["perms", "show"], json_out=True)
@@ -1026,6 +1078,9 @@ def cmd_publish(args) -> int:
         existing_paths.add(hpath)
         ledger.add([item_id])
         already.add(item_id)
+        localized = None
+        if not args.no_localize and (config.get("images") or {}).get("localize", True):
+            localized = localize_after_publish(doc_id, item_id, item.get("url") or "", markdown, config)
         report["published"].append(
             {
                 "id": item_id,
@@ -1035,6 +1090,7 @@ def cmd_publish(args) -> int:
                 "bytes": meta["bytes"],
                 "url": item.get("url"),
                 **({"stub": True} if stub else {}),
+                **({"localized": localized} if localized is not None else {}),
             }
         )
         log(f"✅ {item_id} -> {hpath}")
@@ -1052,6 +1108,50 @@ def cmd_publish(args) -> int:
     save_json(out_path, report)
     print(json.dumps({"ok": not report["failed"], "report": str(out_path), "counts": report["counts"]}, ensure_ascii=False, indent=2))
     return 0 if not report["failed"] else 1
+
+
+def cmd_localize(args) -> int:
+    """给已经入库的文档补做图片本地化：历史批次里的还是远程图片，会被防盗链挡住。"""
+    config = load_config()
+    sources = ["wechat", "x"] if args.source == "all" else [args.source]
+    report: dict = {"ok": True, "sources": {}}
+    for source in sources:
+        base = (config["paths"].get(source) or f"/{source}").rstrip("/")
+        safe = base.replace("'", "''")
+        rows = sy_sql(
+            "select b.id as id, b.hpath as hpath, a.value as url from blocks b "
+            "left join attributes a on a.block_id = b.id and a.name = 'custom-source-url' "
+            f"where b.type = 'd' and b.hpath like '{safe}/%'"
+        )
+        if args.max:
+            rows = rows[: args.max]
+        items: list[dict] = []
+        for row in rows:
+            doc_id = row.get("id") or ""
+            if not doc_id:
+                continue
+            if args.dry_run:
+                items.append({"doc": doc_id, "path": row.get("hpath"), "dry_run": True})
+                continue
+            try:
+                result = localize_assets(doc_id, row.get("url") or "", config=config)
+            except Exception as exc:  # noqa: BLE001 - 单篇失败不影响其余
+                items.append({"doc": doc_id, "path": row.get("hpath"), "error": str(exc)[:300]})
+                continue
+            items.append({"doc": doc_id, "path": row.get("hpath"), **result})
+            if result["converted"]:
+                log(f"🖼 {row.get('hpath')} -> {result['converted']} 个资源本地化")
+        failed = sum(1 for item in items if item.get("error"))
+        report["sources"][source] = {
+            "docs": len(items),
+            "converted": sum(item.get("converted") or 0 for item in items),
+            "failed": failed,
+            "items": items,
+        }
+        if failed:
+            report["ok"] = False
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["ok"] else 1
 
 
 # ---------------------------------------------------------------------- CLI
@@ -1090,12 +1190,23 @@ def main(argv: list[str] | None = None) -> int:
     p_pub.add_argument("--ignore-siyuan", action="store_true", help="只信台账，不扫 SiYuan 文档")
     p_pub.add_argument("--strict-ledger", action="store_true", help="台账不可用就直接失败")
     p_pub.add_argument(
+        "--no-localize",
+        action="store_true",
+        help="不为图片做本地化（默认会调 siyuan.py asset netimg 把远程图刷成本地资源）",
+    )
+    p_pub.add_argument(
         "--stub-on-share",
         action="store_true",
         default=bool(config_default_stub()),
         help="分享页（微信内才有正文）也发一张链接卡片；默认跳过记 failed",
     )
     p_pub.set_defaults(func=cmd_publish)
+
+    p_loc = sub.add_parser("localize", help="给已入库文档补做图片本地化（网络图片转本地）")
+    p_loc.add_argument("--source", choices=["wechat", "x", "all"], default="all")
+    p_loc.add_argument("--max", type=int, default=None, help="每个来源最多处理多少篇")
+    p_loc.add_argument("--dry-run", action="store_true", help="只列出文档，不下载")
+    p_loc.set_defaults(func=cmd_localize)
 
     args = parser.parse_args(argv)
     config = load_config()

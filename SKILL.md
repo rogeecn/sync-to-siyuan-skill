@@ -14,7 +14,7 @@ description: 把「收藏的长文」增量搬进 SiYuan（思源）——ima �
 | [ima skill](https://ima.qq.com) | 知识库条目列表、原文 URL | `node ima_api.cjs openapi/wiki/v1/<endpoint> '<json>'` |
 | [wechat2md](https://github.com/rogeecn/wechat2md) | 微信 HTML → Markdown | `node wechat2md.mjs <url> -o out.md` |
 | [twitter-cli](https://github.com/public-clis/twitter-cli) | 书签列表、X 长文 Markdown | `twitter bookmarks -n N --json` / `twitter article <id> -m` |
-| [siyuan skill](https://github.com/rogeecn/siyuan-skill) | 建文档、块属性、只读 SQL、权限 GUARD | `python3 siyuan.py create/attr/sql` |
+| [siyuan skill](https://github.com/rogeecn/siyuan-skill) | 建文档、块属性、只读 SQL、权限 GUARD、网络图片转本地 | `python3 siyuan.py create/attr/sql/asset netimg` |
 | [id-ledger-query](https://github.com/rogeecn/cf-id-ledger) | 已同步 id 台账 | `POST/GET /v1/projects/<key>/ids` |
 
 ## 配置（一次）
@@ -28,11 +28,14 @@ description: 把「收藏的长文」增量搬进 SiYuan（思源）——ima �
   "ledger_projects": { "wechat": "siyuan-wechat", "x": "siyuan-x-article" },
   "ima": { "knowledge_base": "ima_kb_lBjZm8kf", "scan_limit": 50, "fetch_delay": 12 },
   "x": { "count": 100 },
+  "images": { "localize": true, "timeout": 900 },
   "data_dir": "~/.cache/sync-to-siyuan"
 }
 ```
 
 - `notebook` 是目标笔记本 id（默认 **00-Inspires**）。该库权限必须是 `R,W`，否则 siyuan skill 的 GUARD 直接拒绝。
+- `images.localize`：发布后把正文里的网络图片下载成本地资源（见下文「图片本地化」），默认开；
+  `--no-localize` 可单次关掉，`images.timeout` 是单篇下载的总超时（图多要调大）。
 - 环境变量：`IMA_OPENAPI_CLIENTID` / `IMA_OPENAPI_APIKEY`、`ID_LEDGER_URL` / `ID_LEDGER_TOKEN`、`SIYUAN_API_URL` / `SIYUAN_TOKEN`。
   **这些变量在 `~/.zshenv` 里，自动化/非交互 shell 不会自动加载 —— 先 `source ~/.zshenv`。**
   SiYuan 两兄弟缺失时脚本会回落到 `~/.siyuan-sisyphus/config.json` 里的当前 profile。
@@ -57,9 +60,10 @@ python3 scripts/sync.py plan --source x --count 100
 python3 scripts/sync.py publish --plan ~/.cache/sync-to-siyuan/plan-wechat.json
 python3 scripts/sync.py publish --plan ~/.cache/sync-to-siyuan/plan-x.json --only x:2122895694470185360
 python3 scripts/sync.py status                     # 台账 + SiYuan 各自多少条
+python3 scripts/sync.py localize --source all      # 给已入库文档补做图片本地化（历史批次用）
 ```
 
-`plan` 只产计划、不写库；`publish` 逐条「转换 → create → 写块属性 → 写台账」，单条失败不影响其余，最后输出 `report-<source>-<时间>.json`。
+`plan` 只产计划、不写库；`publish` 逐条「转换 → create → 写块属性 → **图片本地化** → 写台账」，单条失败不影响其余，最后输出 `report-<source>-<时间>.json`。
 
 ### 去重契约（为什么重复跑安全）
 
@@ -111,6 +115,20 @@ SiYuan 的**文档名就是标题**，正文里不再重复一个 H1：
 
 外加块属性 `custom-sync-id` / `custom-source-url` / `custom-sync-source`（**去重与审计都靠它**，别删）。路径 `/wechat/<标题>`、`/x/<标题>`；同名冲突自动加 `(abcd)` 后缀。
 
+### 图片本地化（发布后必做的一步）
+
+微信/知乎的图片有防盗链，正文里留远程链接在思源里会 403/空白。`publish` 每建完一篇就调一次：
+
+```bash
+python3 <siyuan-skill>/scripts/siyuan.py asset netimg <docId> --referer <原网页URL>
+```
+
+- 下载发生在**内核进程**里（需要服务端能出网），图片落成 `assets/network-asset-*` 并改写文档链接；
+- 内核失败是**静默**的（403/404/超时照样返回 `code=0`），所以 CLI 用 `network-asset-*` 数量差报 `converted`，
+  `sync.py` 再拿正文里的远程图片数对账，少于预期就打 `⚠` 并把 `localized` 写进报告；
+- 本地化失败**不会**把文档判成 failed（文档已建、台账已写），重跑 `localize` 即可；
+- 历史批次（本功能上线前入库的文档）用 `localize --source all [--max N] [--dry-run]` 批量补。
+
 文档刚 create 出来时 SiYuan 的 blocks 索引还没落库，`attr set` 会反查失败 —— `publish` 会退避重试 6 次，仍失败的那条正文里还有 `sync-id:` 行，去重不会漏。
 
 > `/X 收藏/YYYY/MM-DD` 里的那些 `custom-tweet-id` 卡片是另一条流程（短卡片，只有推文正文/文章链接，没有长文正文）。本 skill 只往 `/x/` 放长文，两者不冲突、不互相去重。
@@ -140,12 +158,16 @@ SiYuan 的**文档名就是标题**，正文里不再重复一个 H1：
 | `status` 里 `synced: null` | 同上，台账读不到时报 null，**不会把「没读到」显示成 0** |
 | 非交互 shell 里所有凭据都空 | 先 `source ~/.zshenv` |
 | 文档建了但台账没写 | 下次 `publish` 会被 SiYuan 扫描拦住；跑一次 `seed` 把台账补齐 |
+| 文档里图片空白/裂图 | 远程图被防盗链拦下，没本地化。先看报告里的 `localized`（`converted` vs `expected`），再 `python3 scripts/sync.py localize --source wechat --max 5` 重试；仍失败就手工下载 → `siyuan.py asset upload` |
+| `localized.error` / 图片本地化超时 | 内核下载串行，图多的大文档会跑很久。调大 `images.timeout`，或对子标题块 id 分块转 |
+| `converted` 比 `expected` 少很多 | 内核出网被墙、目标站点 403，或响应是 `text/html`。确认服务端可达；必要时给内核设 `system.networkProxy` |
+| `doctor` 报 `siyuan 图片本地化` 失败 | 装的 siyuan-skill 太老，没有 `asset netimg`；升级后重跑（否则发布的图全是远程链接） |
 
 ## 文件
 
 ```
 SKILL.md
-scripts/sync.py        # doctor / seed / plan / publish / status
+scripts/sync.py        # doctor / seed / plan / publish / localize / status
 ```
 
 数据目录 `~/.cache/sync-to-siyuan/`：`plan-<source>.json`、`report-<source>-*.json`、`tmp/*.html|*.md`（转换中间产物）、`w2m/`（wechat2md 的 npm 依赖）、`ima-media-cache.json`（media_id → URL）。
@@ -155,3 +177,5 @@ scripts/sync.py        # doctor / seed / plan / publish / status
 `plan --source all` → `publish`：微信窗口 50 条 → 50 篇全部入库，X 书签 100 条里 3 条长文入库；重跑 plan 两条来源 `new: 0`；台账与 SiYuan 扫描 53 = 53。单篇微信约 25–45s（抓 HTML 3MB + 转换 + 建文档 + 礼貌间隔），50 篇要 20 分钟上下 —— 命令跑长任务时记得给自己留足够的 timeout。
 
 50 篇正文合计 227KB（最大一篇 11.7KB），其中 9 篇是贴图文章（1–6KB + 1–8 张图）。**历史教训**：贴图文章曾因为整页转出 2MB 内联 JS，把 SiYuan 页面卡死 —— 现在体积闸 + JS 特征闸 + wechat2md 的 `cgiDataNew` 解析三重兜底。
+
+图片本地化让每篇发布多几秒到几十秒（串行下载，图越多越慢）。50 篇里绝大多数是 0–8 张图，实测单篇 1–15s；图片多的长文记得把 `images.timeout` 和命令 timeout 都放够。

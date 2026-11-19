@@ -9,7 +9,7 @@
 | [ima-skill](https://ima.qq.com) | 知识库条目列表、原文 URL | `node ima_api.cjs openapi/wiki/v1/<endpoint> '<json>'` |
 | [wechat2md](https://github.com/rogeecn/wechat2md) | 微信 HTML → Markdown | `node wechat2md.mjs article.html -o out.md` |
 | [twitter-cli](https://github.com/public-clis/twitter-cli) | 书签列表、X 长文 Markdown | `twitter bookmarks -n N --json` / `twitter article <id> -m` |
-| [siyuan-skill](https://github.com/rogeecn/siyuan-skill) | 建文档、块属性、只读 SQL、权限 GUARD | `python3 siyuan.py create/attr/sql` |
+| [siyuan-skill](https://github.com/rogeecn/siyuan-skill) | 建文档、块属性、只读 SQL、权限 GUARD、网络图片转本地 | `python3 siyuan.py create/attr/sql/asset netimg` |
 | [id-ledger-query](https://github.com/rogeecn/cf-id-ledger) | 已同步 id 台账 | `POST/GET /v1/projects/<key>/ids` |
 
 ## 效果
@@ -19,7 +19,7 @@
 /x/如何用自己的数据微调一个小模型
 ```
 
-每篇一个文档，正文保留远程图片，顶部一行来源：
+每篇一个文档，正文图片发布后**本地化**（下载成 `assets/network-asset-*`，避开微信/知乎防盗链），顶部一行来源：
 
 ```markdown
 > [可爱的小Cherry](https://mp.weixin.qq.com/s/pteLxFMpqBepmwSqAz_C0g) · 2026年11月17日 21:26
@@ -60,9 +60,12 @@ npm i jsdom turndown turndown-plugin-gfm
   "ledger_projects": { "wechat": "siyuan-wechat", "x": "siyuan-x-article" },
   "ima": { "knowledge_base": "ima_kb_lBjZm8kf", "scan_limit": 50, "fetch_delay": 12 },
   "x": { "count": 100 },
+  "images": { "localize": true, "timeout": 900 },
   "data_dir": "~/.cache/sync-to-siyuan"
 }
 ```
+
+`images.localize` 控制发布后的图片本地化（默认开，`--no-localize` 可单次关掉）；`images.timeout` 是单篇下载超时。
 
 目标笔记本权限必须是 `R,W`：`python3 <siyuan-skill>/scripts/siyuan.py perms set <nb> R,W && perms confirm`。
 
@@ -76,9 +79,10 @@ python3 scripts/sync.py plan                      # 两条来源都扫（默认 
 python3 scripts/sync.py publish --plan ~/.cache/sync-to-siyuan/plan-wechat.json
 python3 scripts/sync.py publish --plan ~/.cache/sync-to-siyuan/plan-x.json --only x:2122895694470185360
 python3 scripts/sync.py status                    # 台账 & SiYuan 各多少条
+python3 scripts/sync.py localize --source all     # 给已入库文档补做图片本地化（历史批次）
 ```
 
-`plan` 只写计划文件，`publish` 才动库；中间可以改 `title`，或把不想收的条目标成 `status: "skip"`。
+`plan` 只写计划文件，`publish` 才动库（逐条：转换 → create → 块属性 → 图片本地化 → 台账）；中间可以改 `title`，或把不想收的条目标成 `status: "skip"`。
 
 ## 增量去重契约
 
@@ -91,11 +95,12 @@ python3 scripts/sync.py status                    # 台账 & SiYuan 各多少条
 
 id 规则：微信 `wx:<slug>`（`mp.weixin.qq.com/s/<slug>`），X 长文 `x:<tweet_id>`（发长文的推文 id）。
 
-## 三个已知的实现细节
+## 四个已知的实现细节
 
 - **图片**：微信正文图片是懒加载，只有 `data-src` 没有 `src`，turndown 会整张丢掉（实测 28 图 → 0 图）。本 skill 自己抓 HTML 把 `data-src` 补成 `src`，再喂给 wechat2md —— 表格/代码块等转换规则仍全部由 wechat2md 负责。
 - **贴图文章**：有一类文章微信只返回分享页模板，页面里没有 `#js_content`，正文和图片全在 `window.cgiDataNew` 里。整页转会把 2MB 内联 JS 当正文写进思源（页面直接卡死）。wechat2md 现在会解这个字面量（`content_noencode` + `picture_page_info_list[].cdn_url`），本 skill 在转换前后另加两道闸：体积 >400KB、或命中 `cgiDataNew`/`__canAsyncImport`/`使用完整服务` 一律丢弃。真拿不到正文的页面记 `failed`，不会写入空文档。
 - **索引异步**：文档刚 `create` 出来时 SiYuan 的 blocks 索引还没落库，`attr set` 会反查失败，`publish` 会退避重试 6 次；仍失败的那条正文里还有 `sync-id:` 行，去重不会漏。
+- **图片本地化**：远程图在思源里会被防盗链拦成 403/空白，所以每篇建完就调 `siyuan.py asset netimg <docId> --referer <原网页>`，把图片下载成 `assets/network-asset-*` 并改写正文。内核下载失败是**静默**的（照样返 `code=0`），脚本用「正文远程图片数 vs 实际转换数」对账，少了就打 `⚠` 并写进报告 —— 图片失败不会把文档判成 failed。
 
 更多细节（X 长文识别、排错表、实测口径）见 [SKILL.md](SKILL.md)。
 
